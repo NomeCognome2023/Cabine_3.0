@@ -1,0 +1,454 @@
+import math, itertools, os
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+from dateutil.relativedelta import relativedelta
+import plotly.express as px
+import plotly.graph_objects as go
+
+
+class InconsistencyException(Exception):
+    pass
+
+
+def get_file_index(files_to_analyze, file_target):
+    """
+
+    :param files_to_analyze: list of path to analyze
+    :param file_target: string representing the file to process
+    :return: the file_target index respect files_to_analyze
+    """
+    index = 0
+    for i, path in enumerate(files_to_analyze):
+        if os.path.basename(path) == file_target:
+            index = i
+    return index
+
+
+def check_time_window(df):
+    """
+
+    :param df: Pandas dataframe containing the readings of the cebe and the underlying customers
+    :return: True if for each combination PODS ID_OBIS present in the dataset there is the same number of days, otherwise return False.
+    """
+    group_counts = df.groupby(['POD', 'ID_OBIS'])['GIORNO_CDC'].count().reset_index()
+    return group_counts['GIORNO_CDC'].nunique() == 1
+
+
+def fill_missing_days(df):
+    """
+
+    :param df: Pandas dataframe containing the readings of the cebe and the underlying customers
+    :return: A copy of  the original dataframe with aligned time window.
+            If a pod has missing reading days, those days are entered and the readings set to NaN
+    """
+
+    tmp_df = df.copy()
+    tmp_df['GIORNO_CDC'] = pd.to_datetime(tmp_df['GIORNO_CDC'], format='%d/%m/%Y')
+
+    unique_pods = tmp_df['POD'].unique()
+
+    min_date = tmp_df['GIORNO_CDC'].min()
+    max_date = tmp_df['GIORNO_CDC'].max()
+    data_range = pd.date_range(start=min_date, end=max_date, freq='D')
+
+    pod_days_combinations = list(itertools.product(unique_pods, data_range))
+    auxiliary_df = pd.DataFrame(pod_days_combinations, columns=['POD', 'GIORNO_CDC'])
+
+    pod_id_obis_df = tmp_df[['POD', 'ID_OBIS', 'TIPO']].drop_duplicates()
+
+    auxiliary_df = pd.merge(auxiliary_df, pod_id_obis_df, on=['POD'])
+    tmp_df = pd.merge(auxiliary_df, tmp_df, on=['POD', 'ID_OBIS', 'GIORNO_CDC', 'TIPO'], how='left')
+
+    return tmp_df
+
+
+def flattening_data(df):
+    """
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers.
+    :return: A copy of the original dataframe reworked in order to have the following SCHEMA
+            POD - ID_OBIS TIPO - PRIMO QUARTO DORA DEL PRIMO GIORNO - SECODO QUARTO DORA DEL PRIMO GIORNO ....
+    """
+    columns_to_drop = ['POD', 'GIORNO_CDC', 'ID_OBIS', 'TIPO', 'OL1', 'OL2', 'OL3', 'OL4']
+
+    min_date = df['GIORNO_CDC'].min()
+    max_date = df['GIORNO_CDC'].max()
+    data_labels = pd.date_range(start=min_date, end=max_date + relativedelta(days=1), freq='15T', inclusive='left')
+
+    new_columns_labels = pd.Index(['POD', 'ID_OBIS', 'TIPO'] + list(data_labels))
+    array = []
+
+    df_pod_id_obis = df.loc[:, ['POD', 'ID_OBIS']].drop_duplicates(subset=['POD', 'ID_OBIS'])
+    elements = list(df_pod_id_obis.to_records(index=False))
+
+    df_pod_types = df.loc[:, ['POD', 'TIPO']].drop_duplicates(subset=['POD', 'TIPO']).set_index('POD')
+
+    for pod, id_obis in tqdm(elements, desc='Processing state'):
+        tmp_df = df[(df['POD'] == pod) & (df['ID_OBIS'] == id_obis)].copy()
+        pod_values = tmp_df.drop(columns_to_drop, axis=1).to_numpy().flatten()
+
+        pod_type = df_pod_types.loc[pod, 'TIPO']
+
+        tmp_info = [pod, id_obis, pod_type]
+        new_row = np.concatenate([tmp_info, pod_values])
+
+        array.append(new_row)
+
+    array = np.array(array)
+
+    D_df = pd.DataFrame(array, columns=new_columns_labels)
+
+    D_df.replace(to_replace='nan', value=np.NaN, regex=True, inplace=True)
+    D_df.iloc[:, 3:] = D_df.iloc[:, 3:].astype(float)
+    D_df.iloc[:, 1:3] = D_df.iloc[:, 1:3].astype(int)
+
+    return D_df
+
+
+def get_unreachability_analysis_df(df):
+    """
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers
+    :return: A dataframe containing for each couple POD, ID_OBIS the percentage of NaN values expressed
+             in the interval (0, 100].
+             0: completely reachable
+             1: completely unreachable
+    """
+    tmp_df = df.copy()
+    new_row_index = tmp_df['POD'].astype('str') + '_' + tmp_df['ID_OBIS'].astype('str')
+    nan_analysis_df = tmp_df.isnull().sum(axis=1).to_frame()
+
+    nan_analysis_df = nan_analysis_df.set_axis(['NaN_PERCENTAGE'], axis='columns')
+    nan_analysis_df.index = new_row_index
+    time_window_width = len(tmp_df.columns) - 3
+    nan_analysis_df.loc[:, 'NaN_PERCENTAGE'] = nan_analysis_df.loc[:, 'NaN_PERCENTAGE'] / time_window_width * 100
+
+    return nan_analysis_df
+
+
+def plot_unreachability_hist(df, edges, colors, title='Unreachability Analysis characterized by ID_OBIS'):
+    """
+
+    :param df: Pandas dataframe generated by the function "get_not_reachability_analysis_df"
+    :param edges: List containing the intervals edges used to color the bins
+    :param colors: List of colors. it must be the same size of "edges"
+    :param title: Histogram Title
+    :return: None
+    """
+    fig = px.histogram(df, x=df.index, y='NaN_PERCENTAGE', nbins=df.shape[0])
+    fig.update_layout(xaxis_title="PODS", yaxis_title="Percentage of unreachable",
+                      xaxis={'tickfont': {'size': 10}, 'tickmode': 'linear', 'dtick': 1})
+
+    intervals = pd.cut(df.loc[:, 'NaN_PERCENTAGE'], bins=edges, labels=[idx for idx in range(len(colors))],
+                       include_lowest=True)
+    bin_colors = ['rgb(255, 255, 255)'] * len(fig.data[0].y)
+    for i in range(len(bin_colors)):
+        bin_colors[i] = colors[intervals[i]]
+
+    fig.update_layout(title=title)
+    fig.update_traces(marker_color=bin_colors)
+    fig.show()
+
+
+def separate_unreachability_pods(df, edges):
+    """
+
+    :param df: Pandas dataframe containing the unreachability analysis produced by the
+               method 'get_unreachability_analysis_df'
+    :param edges: List containing the intervals edges used to define the unreachability interval
+    :return: A dictionary with interval like kay and a list of pods as value
+        {Interval(0, 20, closed='right'): ['pod1','pod2', pod3, ...]
+        Interval(20, 50, closed='right'): ['pod3','pod4', pod5, ...]
+        ...
+        }
+        The pod belongs to a specific interval if it characterized by an unreachability tha satisfy
+        interval_lower_bound < pod_unreachability <= interval_upper_bound.
+        If a specific pod is characterized by two different ID_OBIS we consider only the max value of unreachability.
+
+
+    """
+    tmp_df = df.copy()
+    tmp_df = tmp_df.rename_axis('POD_ID_OBIS').reset_index()
+    tmp_df[['POD', 'ID_OBIS']] = tmp_df['POD_ID_OBIS'].str.split('_').to_list()
+    tmp_df.drop(columns=['POD_ID_OBIS'], inplace=True)
+
+    tmp_df['NaN_PERCENTAGE'] = pd.cut(tmp_df['NaN_PERCENTAGE'], bins=edges)
+    grouped = tmp_df.groupby('POD').agg({'NaN_PERCENTAGE': 'max'})
+    grouped = grouped.reset_index().groupby('NaN_PERCENTAGE')['POD'].apply(list).to_dict()
+
+    return grouped
+
+
+def print_unreachability_summary_table(unreachability_dictionary):
+    """
+
+    :param unreachability_dictionary: Dictionary that for each unreachability interval contain a list of the pods
+                                      characterized by this specific unreachability interval.
+                                      This dictionary is produced by the separate_unreachability_pods() method
+    :return: None
+    """
+    print('UNREACHABILITY SUMMARY TABLE')
+    for interval, pod_list in unreachability_dictionary.items():
+        print('+' + '_' * 160 + '+')
+        print('Unreachability interval:', interval)
+        print('+' + '-' * 160 + '+')
+        print(pod_list)
+        print('+' + '-' * 160 + '+\n')
+
+
+def remove_unreachable_pods(df, unreachability_dict, intervals_to_delete):
+    """
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers
+    :param unreachability_dict: Dictionary that for each unreachability interval contain a list of the pods
+                                characterized by this specific unreachability interval.
+    :param intervals_to_delete: List of the  unreachable interval to remove from df
+    :return: A copy of the original dataframe without the pods that don't satisfy the reachability criteria
+    """
+    tmp_df = df.copy()
+    pods_to_remove = []
+    for key in intervals_to_delete:
+        pods_to_remove.extend(unreachability_dict[key])
+
+    tmp_df = tmp_df.drop(tmp_df[tmp_df['POD'].isin(pods_to_remove)].index)
+    return tmp_df
+
+
+
+def check_consistency(df):
+    """
+
+    This function tests the consistency of the input dataset. In particular, it checks if the CEBE is present in the
+    dataset. By carrying out this check after having carried out the reachability analysis, we are sure that the CEBE
+    is reachable.
+    If this is not the case, an InconsistencyException is thrown.
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers
+    :return: None
+    """
+    if df[df['TIPO'] == 0].empty:
+        raise InconsistencyException("The data is inconsistent! MISSING CEBE.")
+    else:
+        print("The data is consistent, the CEBE is present and sufficiently reachable")
+
+
+def fill_nan(df):
+    """
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers. It must be in the
+               flattened form. It is supposed that the original time discretization is '15min'. It is not necessary to
+               include the columns 'POD', 'ID_OBIS' and 'TIPO'.
+    :return: A portion of the original dataframe containing only the readings on which a historical average is applied
+             in order to fill in the missing data. In the event that you never have readings for a specific day in the
+             period under analysis, you choose the historical average limited to holidays or weekdays, as the case may
+             be.
+    """
+    df_copy = df.iloc[:, 3:].copy()
+    np_df = df_copy.to_numpy()
+    n_rows, _ = df_copy.shape
+    columns = df_copy.columns
+
+    first_day, last_day = columns[0], columns[-1]
+
+    padding_left = first_day.dayofweek
+    padding_right = 6 - last_day.dayofweek
+    n_weeks = last_day.week - first_day.week + 1
+
+    box_view = np.empty((n_rows, n_weeks * 7 * 96))
+    box_view[:] = np.nan
+    box_view[:, 96 * padding_left:-96 * padding_right] = np_df
+    box_view = box_view.reshape((n_rows, n_weeks, 7, 96))
+    mean_box_general = np.mean(box_view, axis=1, where=~np.isnan(box_view))
+
+    mean_box_holiday = np.mean(box_view[:, :, 5:, :], axis=1, where=~np.isnan(box_view[:, :, 5:, :]))
+    mean_box_holiday = np.mean(mean_box_holiday, axis=1, where=~np.isnan(mean_box_holiday))
+
+    mean_box_workday = np.mean(box_view[:, :, :5, :], axis=1, where=~np.isnan(box_view[:, :, :5, :]))
+    mean_box_workday = np.mean(mean_box_workday, axis=1, where=~np.isnan(mean_box_workday))
+
+    rows, cols = np.where(df_copy.isnull())
+
+    print('The system is applying the first strategy...')
+    for idx in tqdm(range(len(rows)), desc='Processing state'):
+        day = df_copy.columns[cols[idx]].dayofweek
+        quarter = df_copy.columns[cols[idx]].hour * 4 + df_copy.columns[cols[idx]].minute // 15
+        row = rows[idx]
+        value = mean_box_general[row, day, quarter]
+        df_copy.iloc[row, cols[idx]] = value
+
+    rows, cols = np.where(df_copy.isnull())
+    print('The system is applying the first strategy...')
+    for idx in tqdm(range(len(rows)), desc='Processing state'):
+        quarter = df_copy.columns[cols[idx]].hour * 4 + df_copy.columns[cols[idx]].minute // 15
+        row = rows[idx]
+        if columns[cols[idx]].dayofweek >= 5:
+            value = mean_box_holiday[row, quarter]
+            df_copy.iloc[row, cols[idx]] = value
+        else:
+            value = mean_box_workday[row, quarter]
+            df_copy.iloc[row, cols[idx]] = value
+
+    return df_copy
+
+
+def plot_costumers_distribution(df, n_plot_per_row, nbins, title):
+    """
+    This function produces for each client a histogram which represents the distribution of the readings associated
+    with the client
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers. It must be in the
+               flattened form.
+    :param n_plot_per_row: Number of the plot wor each row
+    :param title: Main title of the figure
+    :return: None
+    """
+    tmp_df = df.copy()
+    tmp_df.set_index('POD', inplace=True)
+    tmp_df.drop(columns=['TIPO', 'ID_OBIS'], axis=1, inplace=True)
+
+    n_rows, n_cols = math.ceil(tmp_df.shape[0] / n_plot_per_row), n_plot_per_row
+    fig, axes = plt.subplots(nrows=n_rows, ncols=n_cols)
+
+    row_idx = 0
+    col_idx = 0
+    for index, df_row in tmp_df.iterrows():
+        axes[row_idx][col_idx].hist(df_row, bins=nbins)
+        axes[row_idx][col_idx].set_title(index)
+        axes[row_idx][col_idx].grid()
+
+        col_idx = (col_idx + 1) % 5
+        if col_idx == 0:
+            row_idx += 1
+
+    for ax in axes.flat[tmp_df.shape[0]:]:
+        ax.remove()
+
+    fig.suptitle(title)
+    fig_width = 4 * n_cols
+    fig_height = 3 * n_rows
+    fig.set_size_inches(fig_width, fig_height)
+
+    plt.subplots_adjust(hspace=0.4)
+    plt.show()
+
+
+def reduce_time_discretization(df, atomic_time='1H'):
+    """
+    Caution this function causes the loss of Nan values, so before performing it, it is recommended to adopt some
+    strategy for handling missing values.
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers.
+               It must be in the flattened form. It is supposed that the original time discretization is '15min'.
+    :param atomic_time: String that specifies to which atomic time instant you want to convert the time series.
+                        For instance  '30min', '45min', ...
+
+    :return: A copy of the original dataframe with a different time discretization.
+    """
+    tmp_df = df.copy()
+    df_reduced = tmp_df.iloc[:, 3:].T
+    df_reduced.index = pd.DatetimeIndex(tmp_df.columns[3:])
+    df_reduced = df_reduced.resample(atomic_time).sum()
+    df_reduced = df_reduced.T
+    df_reduced = pd.concat([df.iloc[:, :3], df_reduced], axis=1)
+
+    return df_reduced
+
+
+def compute_summary_df(df):
+    """
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers.
+               It must be in the flattened form
+    :return: Pandas dataframe containing the following timeseries
+            'Consumi_CEBE', 'Risalite_CEBE', 'Consumo_netto_CEBE', 'Consumi_Totali_clienti',
+            'Immissioni_Totali_clienti', 'Consumo_totale_netto_clienti',
+            'Perdite', 'Perdite_percentuali'
+    """
+    df_copy = df.copy()
+    row_indexes = [
+        'Consumi_CEBE', 'Risalite_CEBE', 'Consumo_netto_CEBE', 'Consumi_Totali_clienti',
+        'Immissioni_Totali_clienti', 'Consumo_totale_netto_clienti',
+        'Perdite', 'Perdite_percentuali'
+    ]
+
+    summary_df = pd.DataFrame(index=row_indexes, columns=df_copy.columns[3:])
+
+    tmp = df_copy[(df_copy['TIPO'] == 0) & (df_copy['ID_OBIS'] == 146)]
+    summary_df.iloc[0] = tmp.iloc[:, 3:]
+
+    tmp = df_copy[(df_copy['TIPO'] == 0) & (df_copy['ID_OBIS'] == 147)]
+    summary_df.iloc[1] = tmp.iloc[:, 3:]
+
+    summary_df.iloc[2] = summary_df.iloc[0] - summary_df.iloc[1]
+
+    customers_withdrawals_mask = (df_copy['TIPO'] != 0) & (df_copy['ID_OBIS'] == 146)
+    withdrawals_df = df_copy[customers_withdrawals_mask]
+    summary_df.iloc[3] = withdrawals_df.iloc[:, 3:].sum()
+
+    customers_input_mask = (df_copy['TIPO'] != 0) & (df_copy['ID_OBIS'] == 147)
+    inputs_df = df_copy[customers_input_mask]
+    summary_df.iloc[4] = inputs_df.iloc[:, 3:].sum()
+
+    summary_df.iloc[5] = summary_df.iloc[3] - summary_df.iloc[4]
+    summary_df.iloc[6] = summary_df.iloc[2] - summary_df.iloc[5]
+    # summary_df.iloc[7] = summary_df.iloc[6] / summary_df.iloc[2]      ## fixme: (perdite / consumineti_CEBE) causa un errore nel caso in cui consumi_CEBE sia uguale a zero
+
+    return summary_df
+
+
+def plot_the_curve(df, title, x_labels, y_label):
+    """
+
+    This function produces an interactive plot of the time series present within the input dataframe
+
+    :param df: dataframe containing the curves to be plotted. It must be in the flattened form
+    :param title: Plot title
+    :param x_labels: horizontal axis label
+    :param y_label: vertical axis label
+    :return: None
+    """
+    # create a list of traces for each time series
+    traces = []
+    for curve in df.index:
+        traces.append(go.Scatter(x=df.columns, y=df.loc[curve, :], mode='lines', name=curve))
+
+    # create the figure and update the layout
+    fig = go.Figure(data=traces)
+    fig.update_layout(title=title, xaxis_title=x_labels, yaxis_title=y_label)
+
+    # add interactivity to the plot
+    fig.update_layout(hovermode='x')
+    fig.update_traces(hovertemplate="Time: %{x}<br>Value: %{y}")
+
+    # show the plot
+    fig.show()
+
+
+def compute_metrics(df, curve_to_compare, metrics_to_compute):
+    """
+
+    :param df: Pandas dataframe containing the readings of the CEBE and the underlying customers.
+               It must be in the flattened form.
+
+    :param curve_to_compare: PandasSeries representing the time series to compare with the customers curve
+    :param metrics_to_compute: Dictionary contain the metrics to use for comparison.
+                               It must be the form {'metric_name1': metric1, 'metric_name2': metric2, ... }
+    :return: Pandas dataframe containing for each POD the computed metrics.
+    """
+    metrics_df = df[(df['TIPO'] != 0) & (df['ID_OBIS'] == 146)].copy()
+    metrics_df.set_index('POD', inplace=True)
+    metrics_df.drop(columns=['TIPO', 'ID_OBIS'], axis=1, inplace=True)
+
+    tmp_dict = {}
+
+    for metric_name, metric in tqdm(metrics_to_compute.items()):
+        tmp_dict[metric_name] = metrics_df.apply(lambda row: metric(row, curve_to_compare), axis=1)
+
+    metrics_df = pd.DataFrame(tmp_dict)
+    return metrics_df
+
+
+# Press the green button in the gutter to run the script.
+if __name__ == '__main__':
+    print('PyCharm')
